@@ -2,10 +2,11 @@ package service
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"strings"
+	"time"
 
+	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/compat"
 	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/model"
 	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/repository"
 )
@@ -28,10 +29,11 @@ type CompleteAttemptRequest struct {
 }
 
 type SyncRequest struct {
-	UserID   int64  `json:"user_id"`
-	DeviceID string `json:"device_id"`
-	Cursor   int64  `json:"cursor"`
-	Limit    int    `json:"limit"`
+	UserID    int64  `json:"user_id"`
+	DeviceID  string `json:"device_id"`
+	Cursor    int64  `json:"cursor"`
+	AckCursor int64  `json:"ack_cursor"`
+	Limit     int    `json:"limit"`
 }
 
 type MessageService struct {
@@ -46,7 +48,7 @@ func NewMessageService(repo repository.MessageRepository) *MessageService {
 // Earlier mobile clients did not always provide a local message id, so several compatibility paths exist in this codebase.
 func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, model.DeliveryAttempt, error) {
 	if req.SenderID <= 0 || req.ReceiverID <= 0 || req.ConversationID <= 0 || strings.TrimSpace(req.Content) == "" {
-		log.Println("send message rejected")
+		log.Printf("event=send_rejected request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s reason=invalid_request", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID)
 		return model.Message{}, model.DeliveryAttempt{}, errors.New("invalid request")
 	}
 
@@ -60,17 +62,24 @@ func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, mod
 		Status:         model.MessageStatusSending,
 	}
 
-	saved, err := s.repo.CreateMessage(msg)
-	if err != nil {
-		log.Println("send message create failed")
-		return model.Message{}, model.DeliveryAttempt{}, err
+	dedupeWindow := time.Duration(0)
+	if strings.TrimSpace(req.ClientMsgID) == "" {
+		if sec := compat.LegacyDedupeWindowSeconds(req.DeviceID); sec > 0 {
+			dedupeWindow = time.Duration(sec) * time.Second
+		}
 	}
 
-	attempt, err := s.repo.StartAttempt(saved.ID, fmt.Sprintf("provider-%d", saved.ID))
+	saved, attempt, deduped, dedupeReason, err := s.repo.SendMessage(msg, dedupeWindow)
 	if err != nil {
-		log.Println("send attempt failed")
-		return saved, model.DeliveryAttempt{}, err
+		log.Printf("event=send_failed request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s error=%v", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID, err)
+		return model.Message{}, model.DeliveryAttempt{}, err
 	}
+	if deduped {
+		log.Printf("event=send_deduped request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s message_id=%d attempt_id=%d reason=%s", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID, saved.ID, attempt.ID, dedupeReason)
+		return saved, attempt, nil
+	}
+	log.Printf("event=send_message_created request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s message_id=%d status=%s", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID, saved.ID, saved.Status)
+	log.Printf("event=send_attempt_started request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s message_id=%d attempt_id=%d", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID, saved.ID, attempt.ID)
 	return saved, attempt, nil
 }
 
@@ -80,43 +89,35 @@ func (s *MessageService) CompleteAttempt(req CompleteAttemptRequest) (model.Mess
 	}
 	msg, err := s.repo.CompleteAttempt(req.AttemptID, req.Success, req.ErrorCode)
 	if err != nil {
-		log.Println("complete attempt failed")
+		log.Printf("event=callback_failed attempt_id=%d success=%t error_code=%s error=%v", req.AttemptID, req.Success, req.ErrorCode, err)
+		return msg, err
 	}
+	log.Printf("event=callback_applied attempt_id=%d success=%t error_code=%s message_id=%d active_attempt_id=%d message_status=%s version=%d", req.AttemptID, req.Success, req.ErrorCode, msg.ID, msg.ActiveAttemptID, msg.Status, msg.Version)
 	return msg, err
 }
 
 // RetryMessage keeps the resend flow compact for the initial API version.
 // The compatibility layer expects failed messages to become visible as sending again.
 func (s *MessageService) RetryMessage(messageID int64) (model.Message, model.DeliveryAttempt, error) {
-	msg, err := s.repo.GetMessage(messageID)
+	msg, attempt, err := s.repo.RetryMessage(messageID)
 	if err != nil {
-		log.Println("retry load message failed")
+		log.Printf("event=retry_failed message_id=%d error=%v", messageID, err)
 		return model.Message{}, model.DeliveryAttempt{}, err
 	}
-	msg.Status = model.MessageStatusSending
-	msg, err = s.repo.SaveMessage(msg)
-	if err != nil {
-		log.Println("retry save message failed")
-		return model.Message{}, model.DeliveryAttempt{}, err
-	}
-	attempt, err := s.repo.StartAttempt(msg.ID, fmt.Sprintf("retry-%d", msg.ID))
-	if err != nil {
-		log.Println("retry start attempt failed")
-		return msg, model.DeliveryAttempt{}, err
-	}
+	log.Printf("event=retry_completed message_id=%d attempt_id=%d active_attempt_id=%d message_status=%s", msg.ID, attempt.ID, msg.ActiveAttemptID, msg.Status)
 	return msg, attempt, nil
 }
 
 // ListConversationMessages keeps offset for the first HTTP API version.
 // Some mobile clients still pass offset and limit from local scroll state.
-func (s *MessageService) ListConversationMessages(conversationID int64, offset int, limit int) ([]model.Message, error) {
+func (s *MessageService) ListConversationMessages(userID int64, conversationID int64, offset int, limit int) ([]model.Message, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	if limit > 100 {
 		limit = 100
 	}
-	items, err := s.repo.ListConversationMessages(conversationID, offset, limit)
+	items, err := s.repo.ListConversationMessages(userID, conversationID, offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +139,13 @@ func (s *MessageService) GetConversationSummary(userID int64, conversationID int
 }
 
 func (s *MessageService) MarkConversationRead(userID int64, conversationID int64) error {
-	return s.repo.MarkConversationRead(userID, conversationID)
+	err := s.repo.MarkConversationRead(userID, conversationID)
+	if err != nil {
+		log.Printf("event=mark_read_failed user_id=%d conversation_id=%d error=%v", userID, conversationID, err)
+		return err
+	}
+	log.Printf("event=conversation_marked_read user_id=%d conversation_id=%d", userID, conversationID)
+	return nil
 }
 
 func (s *MessageService) SetLegacyDisplayStatus(messageID int64, status string) (model.Message, error) {
@@ -150,12 +157,16 @@ func (s *MessageService) DeleteMessage(messageID int64) (model.Message, error) {
 }
 
 func (s *MessageService) Sync(req SyncRequest) ([]model.SyncEvent, int64, error) {
+	if req.AckCursor > 0 {
+		s.repo.AckDeviceCursor(req.UserID, req.DeviceID, req.AckCursor)
+	}
 	cursor := req.Cursor
 	if cursor == 0 {
 		cursor = s.repo.GetDeviceCursor(req.UserID, req.DeviceID)
 	}
 	events, err := s.repo.ListEventsAfter(req.UserID, cursor)
 	if err != nil {
+		log.Printf("event=sync_failed user_id=%d device_id=%s request_cursor=%d ack_cursor=%d error=%v", req.UserID, req.DeviceID, req.Cursor, req.AckCursor, err)
 		return nil, cursor, err
 	}
 	if req.Limit > 0 && len(events) > req.Limit {
@@ -167,6 +178,6 @@ func (s *MessageService) Sync(req SyncRequest) ([]model.SyncEvent, int64, error)
 			nextCursor = ev.Seq
 		}
 	}
-	s.repo.SaveDeviceCursor(req.UserID, req.DeviceID, nextCursor)
+	log.Printf("event=sync_completed user_id=%d device_id=%s request_cursor=%d ack_cursor=%d effective_cursor=%d next_cursor=%d event_count=%d", req.UserID, req.DeviceID, req.Cursor, req.AckCursor, cursor, nextCursor, len(events))
 	return events, nextCursor, nil
 }

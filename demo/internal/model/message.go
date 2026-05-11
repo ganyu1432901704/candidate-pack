@@ -47,14 +47,18 @@ type DeliveryAttempt struct {
 }
 
 type SyncEvent struct {
-	Seq            int64     `json:"seq"`
-	UserID         int64     `json:"user_id"`
-	DeviceID       string    `json:"device_id"`
-	ConversationID int64     `json:"conversation_id"`
-	MessageID      int64     `json:"message_id"`
-	EventType      string    `json:"event_type"`
-	MessageStatus  string    `json:"message_status"`
-	CreatedAt      time.Time `json:"created_at"`
+	Seq                  int64     `json:"seq"`
+	UserID               int64     `json:"user_id"`
+	DeviceID             string    `json:"device_id"`
+	ConversationID       int64     `json:"conversation_id"`
+	MessageID            int64     `json:"message_id"`
+	MessageVersion       int64     `json:"message_version"`
+	EventType            string    `json:"event_type"`
+	MessageStatus        string    `json:"message_status"`
+	SummaryUnreadCount   int       `json:"summary_unread_count"`
+	SummaryLastMessageID int64     `json:"summary_last_message_id"`
+	ReadMessageID        int64     `json:"read_message_id"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 type ConversationSummary struct {

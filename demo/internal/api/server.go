@@ -42,8 +42,9 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	userID, _ := strconv.ParseInt(r.URL.Query().Get("user_id"), 10, 64)
 	cursor, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
+	ackCursor, _ := strconv.ParseInt(r.URL.Query().Get("ack_cursor"), 10, 64)
 	deviceID := r.URL.Query().Get("device_id")
-	events, next, err := s.svc.Sync(service.SyncRequest{UserID: userID, DeviceID: deviceID, Cursor: cursor})
+	events, next, err := s.svc.Sync(service.SyncRequest{UserID: userID, DeviceID: deviceID, Cursor: cursor, AckCursor: ackCursor})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
