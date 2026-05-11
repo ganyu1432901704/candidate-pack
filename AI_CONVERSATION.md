@@ -411,6 +411,23 @@ P1
 
 请用 code review 风格输出。
 ```
+### ai回复重点
+```
+Findings
+
+[P0] 发送幂等检查不是原子的，并发下仍然会重复建消息。SendMessage 先调用 FindByClientMsgID/FindLikelyDuplicateMessage，再单独调用 CreateMessage，中间没有同一事务边界；两个并发请求可以同时 miss，再各自成功创建消息。message_service.go (line 66) message_service.go (line 98) message_repository.go (line 87) 这和 需求说明.md 里最核心的“网络抖动/重复点击不产生重复消息”目标仍然冲突。现有测试也只覆盖串行调用，没有覆盖这个真正危险的并发场景。public_test.go (line 61)
+
+[P0] 已读状态不会通过 sync 传播，多设备未读/最近会话仍然可能长期不一致。MarkConversationRead 只更新服务端 readStates 和 summaries，但没有产生任何 sync event；Sync 仍然只返回消息事件，所以同一用户另一台设备根本拿不到“这个会话已读了”的变化。message_repository.go (line 393) message_service.go (line 187) 这没有满足需求文档里“同一个用户在手机和网页端看到的未读角标和最近聊天列表长期不一致”的重点问题。
+
+[P1] 聊天详情页的可见性规则没有真正修到主读取链路，receiver 仍可能看到 sender 的 sending/failed 消息。你们把 sender/receiver 可见性只实现到了 summary 重算里，但 ListConversationMessages 仍然只按 conversationID 返回所有未删除消息，而且 service 层没有 userID 入参来做过滤。message_service.go (line 141) message_repository.go (line 346) 这意味着“最近会话口径修了，但详情页口径没修”，需求中的“聊天窗口里可靠展示”还没完全闭环。
+
+[P1] summaryKey 继续用 string(rune(id)) 组 key，现在又被 read state 复用，风险比以前更大。这个实现不稳定且可读性差，大 ID 还有碰撞/不可预期编码风险；一旦 key 出问题，会直接把 summaries 和 readStates 串数据，造成未读数和最近会话污染。message_repository.go (line 75) message_repository.go (line 397) 以前它只影响 summary，现在它已经进入“未读真相源”，风险被放大了。
+
+[P2] 新的锁粒度和重算策略比较粗，随着会话消息变多会放大写路径阻塞。现在几乎所有写操作都拿全局 mu，并在锁内做 rebuildSummaryLocked，而它会扫描整个会话消息列表；这会把发送、回调、retry、mark read、sync cursor 访问串行化，和需求里“消息变多后查询/链路变慢”的目标有冲突。message_repository.go (line 41) message_repository.go (line 469) 这在 demo 里能工作，但已经是明显的后续演进点。
+
+[P2] 回调日志有误导性，很多“被忽略的 callback”会被记录成 callback_applied。repository 在重复回放或 stale attempt 时直接返回 nil error 和当前 message，但 service 看不到“是否真的应用了状态”，于是统一打 callback_applied 日志。message_repository.go (line 238) message_repository.go (line 251) message_service.go (line 118) 这会削弱需求里很强调的“线上排障能力”。
+
+```
 
 ### 提示词
 ```
@@ -423,14 +440,15 @@ P1
 
 1. 小步修改，避免大规模重构
 
-2. 优先保证主链路一致性
+2. 如果问题必须重大修改(比如引入新组件、问题修复方案过于复杂等)请暂时跳过，在最后报告中提示我，让我来做决策
 
-3. 不引入复杂架构（MQ、Event Sourcing、CQRS 等）
+3. 优先保证主链路一致性
 
-4. 明确状态流转与幂等规则
+4. 不引入复杂架构（MQ、Event Sourcing、CQRS 等）
 
-5. 增加必要 structured log
+5. 明确状态流转与幂等规则
 
+6. 增加必要 structured log
 
 
 全部完成后，请重新 review 整个系统，并生成 Markdown Review 报告，重点检查：
