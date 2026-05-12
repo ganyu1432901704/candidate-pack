@@ -11,6 +11,11 @@ import (
 	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/repository"
 )
 
+const (
+	maxMessageContentLength = 4096
+	maxSyncLimit            = 100
+)
+
 type SendMessageRequest struct {
 	RequestID      string `json:"request_id"`
 	SenderID       int64  `json:"sender_id"`
@@ -29,11 +34,12 @@ type CompleteAttemptRequest struct {
 }
 
 type SyncRequest struct {
-	UserID    int64  `json:"user_id"`
-	DeviceID  string `json:"device_id"`
-	Cursor    int64  `json:"cursor"`
-	AckCursor int64  `json:"ack_cursor"`
-	Limit     int    `json:"limit"`
+	UserID     int64  `json:"user_id"`
+	DeviceID   string `json:"device_id"`
+	Cursor     int64  `json:"cursor"`
+	AckCursor  int64  `json:"ack_cursor"`
+	Limit      int    `json:"limit"`
+	UseAckMode bool   `json:"-"`
 }
 
 type MessageService struct {
@@ -47,9 +53,14 @@ func NewMessageService(repo repository.MessageRepository) *MessageService {
 // SendMessage creates a message and starts provider delivery.
 // Earlier mobile clients did not always provide a local message id, so several compatibility paths exist in this codebase.
 func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, model.DeliveryAttempt, error) {
-	if req.SenderID <= 0 || req.ReceiverID <= 0 || req.ConversationID <= 0 || strings.TrimSpace(req.Content) == "" {
+	content := strings.TrimSpace(req.Content)
+	if req.SenderID <= 0 || req.ReceiverID <= 0 || req.ConversationID <= 0 || content == "" {
 		log.Printf("event=send_rejected request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s reason=invalid_request", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID)
 		return model.Message{}, model.DeliveryAttempt{}, errors.New("invalid request")
+	}
+	if len(content) > maxMessageContentLength {
+		log.Printf("event=send_rejected request_id=%s sender_id=%d receiver_id=%d conversation_id=%d device_id=%s client_msg_id=%s reason=content_too_long", req.RequestID, req.SenderID, req.ReceiverID, req.ConversationID, req.DeviceID, req.ClientMsgID)
+		return model.Message{}, model.DeliveryAttempt{}, errors.New("content too long")
 	}
 
 	msg := model.Message{
@@ -58,7 +69,7 @@ func (s *MessageService) SendMessage(req SendMessageRequest) (model.Message, mod
 		DeviceID:       req.DeviceID,
 		ConversationID: req.ConversationID,
 		ClientMsgID:    req.ClientMsgID,
-		Content:        req.Content,
+		Content:        content,
 		Status:         model.MessageStatusSending,
 	}
 
@@ -157,16 +168,31 @@ func (s *MessageService) DeleteMessage(messageID int64) (model.Message, error) {
 }
 
 func (s *MessageService) Sync(req SyncRequest) ([]model.SyncEvent, int64, error) {
-	if req.AckCursor > 0 {
+	if req.UserID <= 0 || strings.TrimSpace(req.DeviceID) == "" || req.Cursor < 0 || req.AckCursor < 0 {
+		return nil, 0, errors.New("invalid sync request")
+	}
+	if req.Limit < 0 {
+		return nil, 0, errors.New("invalid sync request")
+	}
+	if req.Limit > maxSyncLimit {
+		req.Limit = maxSyncLimit
+	}
+
+	ackMode := req.UseAckMode || s.repo.IsAckMode(req.UserID, req.DeviceID)
+	if req.UseAckMode {
+		s.repo.EnableAckMode(req.UserID, req.DeviceID)
+	}
+	if ackMode && req.AckCursor > 0 {
 		s.repo.AckDeviceCursor(req.UserID, req.DeviceID, req.AckCursor)
 	}
+
 	cursor := req.Cursor
 	if cursor == 0 {
 		cursor = s.repo.GetDeviceCursor(req.UserID, req.DeviceID)
 	}
 	events, err := s.repo.ListEventsAfter(req.UserID, cursor)
 	if err != nil {
-		log.Printf("event=sync_failed user_id=%d device_id=%s request_cursor=%d ack_cursor=%d error=%v", req.UserID, req.DeviceID, req.Cursor, req.AckCursor, err)
+		log.Printf("event=sync_failed user_id=%d device_id=%s request_cursor=%d ack_cursor=%d mode=%s error=%v", req.UserID, req.DeviceID, req.Cursor, req.AckCursor, syncModeLabel(ackMode), err)
 		return nil, cursor, err
 	}
 	if req.Limit > 0 && len(events) > req.Limit {
@@ -178,6 +204,16 @@ func (s *MessageService) Sync(req SyncRequest) ([]model.SyncEvent, int64, error)
 			nextCursor = ev.Seq
 		}
 	}
-	log.Printf("event=sync_completed user_id=%d device_id=%s request_cursor=%d ack_cursor=%d effective_cursor=%d next_cursor=%d event_count=%d", req.UserID, req.DeviceID, req.Cursor, req.AckCursor, cursor, nextCursor, len(events))
+	if !ackMode {
+		s.repo.SaveDeviceCursor(req.UserID, req.DeviceID, nextCursor)
+	}
+	log.Printf("event=sync_completed user_id=%d device_id=%s request_cursor=%d ack_cursor=%d effective_cursor=%d next_cursor=%d event_count=%d mode=%s", req.UserID, req.DeviceID, req.Cursor, req.AckCursor, cursor, nextCursor, len(events), syncModeLabel(ackMode))
 	return events, nextCursor, nil
+}
+
+func syncModeLabel(ackMode bool) string {
+	if ackMode {
+		return "ack"
+	}
+	return "legacy"
 }

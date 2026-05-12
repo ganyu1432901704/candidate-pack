@@ -2,9 +2,12 @@ package tests
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
+	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/api"
 	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/model"
 	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/repository"
 	"github.com/example/backend-ai-coding-challenge-demo-v6/internal/service"
@@ -44,6 +47,15 @@ func TestSendMessageCreatesAttempt(t *testing.T) {
 	}
 	if msg.Status != model.MessageStatusSending {
 		t.Fatalf("expected sending status, got %s", msg.Status)
+	}
+}
+
+func TestSendMessageRejectsOversizedContent(t *testing.T) {
+	svc := newService()
+	req := sendRequest("local-too-large")
+	req.Content = string(make([]byte, 4097))
+	if _, _, err := svc.SendMessage(req); err == nil {
+		t.Fatalf("expected oversized content to be rejected")
 	}
 }
 
@@ -452,7 +464,7 @@ func TestSyncCursorRequiresAckBeforeAdvancing(t *testing.T) {
 		t.Fatalf("complete attempt failed: %v", err)
 	}
 
-	firstEvents, nextCursor, err := svc.Sync(service.SyncRequest{UserID: 2, DeviceID: "device-sync", Cursor: 0})
+	firstEvents, nextCursor, err := svc.Sync(service.SyncRequest{UserID: 2, DeviceID: "device-sync", Cursor: 0, UseAckMode: true})
 	if err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
@@ -499,6 +511,34 @@ func TestSyncCursorRequiresAckBeforeAdvancing(t *testing.T) {
 	}
 }
 
+func TestSyncLegacyModeAdvancesCursorWithoutAck(t *testing.T) {
+	svc := newService()
+	_, attempt := send(t, svc, "local-sync-legacy")
+	_, err := svc.CompleteAttempt(service.CompleteAttemptRequest{AttemptID: attempt.ID, Success: true})
+	if err != nil {
+		t.Fatalf("complete attempt failed: %v", err)
+	}
+
+	firstEvents, nextCursor, err := svc.Sync(service.SyncRequest{UserID: 2, DeviceID: "device-legacy-sync", Cursor: 0})
+	if err != nil {
+		t.Fatalf("first legacy sync failed: %v", err)
+	}
+	if len(firstEvents) == 0 || nextCursor == 0 {
+		t.Fatalf("expected first legacy sync to return events and cursor")
+	}
+
+	secondEvents, secondCursor, err := svc.Sync(service.SyncRequest{UserID: 2, DeviceID: "device-legacy-sync", Cursor: 0})
+	if err != nil {
+		t.Fatalf("second legacy sync failed: %v", err)
+	}
+	if len(secondEvents) != 0 {
+		t.Fatalf("expected legacy sync to advance cursor without ack, got %d replayed events", len(secondEvents))
+	}
+	if secondCursor != nextCursor {
+		t.Fatalf("expected legacy cursor to remain at %d, got %d", nextCursor, secondCursor)
+	}
+}
+
 func TestMarkReadProducesSummarySyncEvent(t *testing.T) {
 	svc := newService()
 	_, attempt := send(t, svc, "local-read-sync")
@@ -520,10 +560,11 @@ func TestMarkReadProducesSummarySyncEvent(t *testing.T) {
 	}
 
 	events, _, err := svc.Sync(service.SyncRequest{
-		UserID:    2,
-		DeviceID:  "device-read-sync",
-		Cursor:    0,
-		AckCursor: nextCursor,
+		UserID:     2,
+		DeviceID:   "device-read-sync",
+		Cursor:     0,
+		AckCursor:  nextCursor,
+		UseAckMode: true,
 	})
 	if err != nil {
 		t.Fatalf("sync after read failed: %v", err)
@@ -542,5 +583,34 @@ func TestMarkReadProducesSummarySyncEvent(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected mark read to produce summary update sync event")
+	}
+}
+
+func TestSyncRejectsInvalidRequest(t *testing.T) {
+	svc := newService()
+	if _, _, err := svc.Sync(service.SyncRequest{UserID: 0, DeviceID: "device"}); err == nil {
+		t.Fatalf("expected invalid user id to be rejected")
+	}
+	if _, _, err := svc.Sync(service.SyncRequest{UserID: 1, DeviceID: "", Cursor: 0}); err == nil {
+		t.Fatalf("expected empty device id to be rejected")
+	}
+	if _, _, err := svc.Sync(service.SyncRequest{UserID: 1, DeviceID: "device", Cursor: -1}); err == nil {
+		t.Fatalf("expected negative cursor to be rejected")
+	}
+}
+
+func TestSyncHTTPRejectsInvalidQuery(t *testing.T) {
+	repo := repository.NewMemoryMessageRepository()
+	svc := service.NewMessageService(repo)
+	server := api.NewServer(svc)
+	mux := http.NewServeMux()
+	server.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/sync?user_id=nope&device_id=device", nil)
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid query to return 400, got %d", resp.Code)
 	}
 }

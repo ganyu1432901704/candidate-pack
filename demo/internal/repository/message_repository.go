@@ -35,6 +35,8 @@ type MessageRepository interface {
 	MarkConversationRead(userID int64, conversationID int64) error
 	ListEventsAfter(userID int64, cursor int64) ([]model.SyncEvent, error)
 	GetDeviceCursor(userID int64, deviceID string) int64
+	EnableAckMode(userID int64, deviceID string)
+	IsAckMode(userID int64, deviceID string) bool
 	AckDeviceCursor(userID int64, deviceID string, cursor int64) int64
 	SaveDeviceCursor(userID int64, deviceID string, cursor int64)
 }
@@ -53,6 +55,7 @@ type MemoryMessageRepository struct {
 	events               []model.SyncEvent
 	summaries            map[string]model.ConversationSummary
 	deviceCursors        map[string]int64
+	deviceAckModes       map[string]bool
 	clientMsgIndex       map[string]int64
 	readStates           map[string]readmodel.ReadState
 }
@@ -69,6 +72,7 @@ func NewMemoryMessageRepository() *MemoryMessageRepository {
 		events:               make([]model.SyncEvent, 0),
 		summaries:            make(map[string]model.ConversationSummary),
 		deviceCursors:        make(map[string]int64),
+		deviceAckModes:       make(map[string]bool),
 		clientMsgIndex:       make(map[string]int64),
 		readStates:           make(map[string]readmodel.ReadState),
 	}
@@ -406,6 +410,18 @@ func (r *MemoryMessageRepository) SaveDeviceCursor(userID int64, deviceID string
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deviceCursors[deviceKey(userID, deviceID)] = cursor
+}
+
+func (r *MemoryMessageRepository) EnableAckMode(userID int64, deviceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deviceAckModes[deviceKey(userID, deviceID)] = true
+}
+
+func (r *MemoryMessageRepository) IsAckMode(userID int64, deviceID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.deviceAckModes[deviceKey(userID, deviceID)]
 }
 
 func (r *MemoryMessageRepository) AckDeviceCursor(userID int64, deviceID string, cursor int64) int64 {

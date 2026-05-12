@@ -40,14 +40,60 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
-	userID, _ := strconv.ParseInt(r.URL.Query().Get("user_id"), 10, 64)
-	cursor, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
-	ackCursor, _ := strconv.ParseInt(r.URL.Query().Get("ack_cursor"), 10, 64)
+	userID, err := parseRequiredInt64(r, "user_id")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	cursor, err := parseOptionalInt64(r, "cursor")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ackCursor, ackProvided, err := parseOptionalInt64WithPresence(r, "ack_cursor")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	deviceID := r.URL.Query().Get("device_id")
-	events, next, err := s.svc.Sync(service.SyncRequest{UserID: userID, DeviceID: deviceID, Cursor: cursor, AckCursor: ackCursor})
+	events, next, err := s.svc.Sync(service.SyncRequest{
+		UserID:     userID,
+		DeviceID:   deviceID,
+		Cursor:     cursor,
+		AckCursor:  ackCursor,
+		UseAckMode: ackProvided,
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"events": events, "next_cursor": next})
+}
+
+func parseRequiredInt64(r *http.Request, key string) (int64, error) {
+	value := r.URL.Query().Get(key)
+	if value == "" {
+		return 0, strconv.ErrSyntax
+	}
+	return strconv.ParseInt(value, 10, 64)
+}
+
+func parseOptionalInt64(r *http.Request, key string) (int64, error) {
+	value := r.URL.Query().Get(key)
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(value, 10, 64)
+}
+
+func parseOptionalInt64WithPresence(r *http.Request, key string) (int64, bool, error) {
+	values, ok := r.URL.Query()[key]
+	if !ok || len(values) == 0 {
+		return 0, false, nil
+	}
+	parsed, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil {
+		return 0, true, err
+	}
+	return parsed, true, nil
 }
